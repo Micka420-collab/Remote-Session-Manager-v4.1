@@ -20,6 +20,8 @@
 - 🎨 **Thèmes personnalisables** - Interface claire ou sombre
 - 📤 **Export des logs** - Sauvegarde de l'historique des commandes
 - 🧹 **Nettoyage profil admin** - Suppression automatique du profil admin à la déconnexion
+- 🛠️ **Préparer ce poste (WinRM)** - Configure WinRM/TrustedHosts sur le poste local en un clic
+- 🩺 **Diagnostic de connexion** - En cas d'échec WinRM, affiche automatiquement la cause et les commandes de correction
 
 ### Raccourcis clavier
 
@@ -74,6 +76,23 @@ Enable-PSRemoting -Force
 # Vérifier la configuration
 winrm quickconfig
 ```
+
+## 🩺 Dépannage : erreur `about_Remote_Troubleshooting`
+
+Si un poste **n'arrive pas à se connecter** (erreur WinRM renvoyant vers `about_Remote_Troubleshooting`)
+alors que ça fonctionne depuis un autre poste, le problème vient de la configuration du poste
+qui initie la connexion, pas de l'outil.
+
+1. Lancer l'application en **Administrateur** (via `Lanceur.cmd`).
+2. Cliquer sur le bouton **« Préparer ce poste (WinRM) »** dans la boîte à outils :
+   il active PSRemoting et configure `TrustedHosts` automatiquement.
+3. Vérifier que le compte utilisé a des **droits admin sur la machine cible**.
+4. Postes hors domaine ou connexion par IP : renseigner la cible dans `TrustedHosts`
+   (le bouton le propose, valeur `*` par défaut).
+5. Vérifier que le port **5985 (WinRM)** n'est pas bloqué par un pare-feu : `Test-WSMan -ComputerName <cible>`.
+
+En cas d'échec, l'outil écrit désormais un **diagnostic détaillé dans la console** indiquant
+précisément l'étape qui bloque et la commande pour la corriger.
 
 ## 📁 Structure du projet
 

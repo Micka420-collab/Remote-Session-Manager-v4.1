@@ -1,7 +1,7 @@
-<#
+﻿<#
     RemoteSessionManager.ps1
     Utilitaire de gestion de sessions distantes.
-    Version 4.0
+    Version 4.1
     - Historique des commandes (↑/↓)
     - Boutons: Effacer Console, Exporter Log, Infos Système, Redémarrer, EventViewer
     - Timer de session
@@ -104,6 +104,7 @@ Add-Type -AssemblyName System.Windows.Forms
                 <DockPanel>
                     <TextBlock Text="PS >" Foreground="#00FF00" FontFamily="Consolas" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,10,0"/>
                     <Button Name="btnSendCmd" DockPanel.Dock="Right" Content="Envoyer" Background="#555" Foreground="White" Width="60"/>
+                    <Button Name="btnCancelCmd" DockPanel.Dock="Right" Content="Annuler" Background="#D9534F" Foreground="White" Width="60" Margin="0,0,8,0" Visibility="Collapsed" ToolTip="Arreter la commande en cours"/>
                     <TextBox Name="txtManualInput" FontFamily="Consolas" FontSize="12" Background="#222" Foreground="#FFF" BorderThickness="0" Padding="5" Margin="0,0,10,0"/>
                 </DockPanel>
             </Border>
@@ -148,6 +149,7 @@ Add-Type -AssemblyName System.Windows.Forms
 
         <!-- FOOTER -->
         <Grid Grid.Row="2" Grid.ColumnSpan="3" Margin="5,3,5,0">
+            <ProgressBar Name="pbBusy" IsIndeterminate="True" Height="3" VerticalAlignment="Top" Margin="0,-3,0,0" Background="Transparent" Foreground="#007ACC" BorderThickness="0" Visibility="Collapsed"/>
             <TextBlock Text="Pr&#234;t." Name="lblFooterStatus" Foreground="Gray" FontSize="10" HorizontalAlignment="Left" VerticalAlignment="Center"/>
             <TextBlock Name="lblSessionTimer" Text="" Foreground="#007ACC" FontSize="10" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             <TextBlock Name="lblVersion" Text="By Hotline6 - v4.1 [???]" Foreground="Gray" FontSize="10" HorizontalAlignment="Right" VerticalAlignment="Center" Cursor="Hand" ToolTip="Il parait qu'un mot magique existe..."/>
@@ -176,6 +178,8 @@ $pnlToolsNormal = $window.FindName("pnlToolsNormal")
 
 $txtManualInput = $window.FindName("txtManualInput")
 $btnSendCmd = $window.FindName("btnSendCmd")
+$btnCancelCmd = $window.FindName("btnCancelCmd")
+$pbBusy = $window.FindName("pbBusy")
 $lblFooterStatus = $window.FindName("lblFooterStatus")
 $btnPing = $window.FindName("btnPing")
 $btnExternalConsole = $window.FindName("btnExternalConsole")
@@ -197,6 +201,74 @@ $script:currentSession = $null
 $script:targetName = $null
 $script:currentPath = ""
 
+# Dossier local pour les rapports/fichiers recuperes (D:\Temp si dispo, sinon Documents)
+$script:LocalSaveDir = if (Test-Path 'D:\') { 'D:\Temp' } else { Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'RSM' }
+
+# Resolution centralisee du nom de la cible :
+# respecte la case "Sans PRT" et les noms de machine complets (avec lettres).
+# Retourne $null si la saisie est vide/invalide.
+function Resolve-Target {
+    $inputText = $txtComputerNumber.Text.Trim()
+    if ([string]::IsNullOrEmpty($inputText)) { return $null }
+    if ($chkNoPRT.IsChecked -or $inputText -match '[a-zA-Z]') {
+        return $inputText
+    }
+    $num = $inputText -replace "[^0-9]", ""
+    if ([string]::IsNullOrEmpty($num)) { return $null }
+    return "PRT$num"
+}
+
+# Diagnostic d'un echec de connexion WinRM (erreur "about_Remote_Troubleshooting").
+# Distingue les problemes cote poste local (client WinRM, TrustedHosts) des problemes
+# cote cible (machine eteinte, WinRM off, pare-feu) et propose les commandes de correction.
+function Get-ConnectionHelp {
+    param([string]$Target)
+    $lines = @()
+    $lines += "=== AIDE : echec de connexion a $Target ==="
+
+    # 1. Service WinRM local (le poste depuis lequel on lance l'outil)
+    try {
+        $svc = Get-Service WinRM -ErrorAction Stop
+        if ($svc.Status -ne 'Running') {
+            $lines += "[!] Service WinRM LOCAL arrete. En admin sur CE poste : Enable-PSRemoting -Force"
+        }
+        else {
+            $lines += "[OK] Service WinRM local demarre."
+        }
+    }
+    catch {
+        $lines += "[!] Impossible de verifier le service WinRM local."
+    }
+
+    # 2. WinRM cote cible
+    try {
+        Test-WSMan -ComputerName $Target -ErrorAction Stop | Out-Null
+        $lines += "[OK] La cible repond a WinRM => le blocage vient des DROITS / de l'AUTHENTIFICATION / de TrustedHosts, pas du reseau."
+    }
+    catch {
+        $lines += "[!] La cible NE repond PAS a WinRM : machine eteinte, WinRM desactive, ou pare-feu/reseau bloque le port 5985."
+        $lines += "    -> Sur la cible (admin) : Enable-PSRemoting -Force"
+    }
+
+    # 3. TrustedHosts (necessaire hors domaine ou par IP/nom court)
+    try {
+        $th = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value
+        if ([string]::IsNullOrWhiteSpace($th)) {
+            $lines += "[i] TrustedHosts vide. Hors domaine, ajoutez la cible (admin) :"
+            $lines += "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$Target' -Concatenate -Force"
+        }
+        else {
+            $lines += "[i] TrustedHosts actuel : $th"
+        }
+    }
+    catch { }
+
+    $lines += "Autres pistes : lancer l'outil en ADMINISTRATEUR (Lanceur.cmd) ; utiliser un compte"
+    $lines += "ayant les droits admin sur la cible ; verifier que les deux postes sont sur le meme domaine/reseau."
+    $lines += "==========================================="
+    return ($lines -join "`r`n")
+}
+
 # Historique des commandes
 $script:commandHistory = @()
 $script:historyIndex = -1
@@ -214,6 +286,12 @@ $script:sessionTimer.Add_Tick({
             $lblSessionTimer.Text = "Session: ${hours}:${mins}:${secs}"
         }
     })
+
+# Etat d'execution asynchrone des commandes (evite le gel de l'interface)
+$script:currentJob = $null
+$script:currentJobIsManual = $false
+$script:jobTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:jobTimer.Interval = [TimeSpan]::FromMilliseconds(200)
 
 # --- FUNCTIONS ---
 
@@ -233,7 +311,89 @@ function Log-Message {
     $txtOutput.ScrollToEnd()
 }
 
+# Bascule l'interface entre etat "occupe" (commande en cours) et "pret".
+# Pendant l'execution, on desactive les entrees et on montre un indicateur anime
+# pour que l'utilisateur voie clairement que ca travaille (sans figer la fenetre).
+function Set-BusyState {
+    param([bool]$Busy)
+    if ($Busy) {
+        $window.Cursor = [System.Windows.Input.Cursors]::AppStarting
+        $pbBusy.Visibility = "Visible"
+        $lblFooterStatus.Text = "Execution en cours... (patientez)"
+        $btnCancelCmd.Visibility = "Visible"
+        $btnCancelCmd.IsEnabled = $true
+    }
+    else {
+        $window.Cursor = [System.Windows.Input.Cursors]::Arrow
+        $pbBusy.Visibility = "Collapsed"
+        $lblFooterStatus.Text = "Pret."
+        $btnCancelCmd.Visibility = "Collapsed"
+        $btnCancelCmd.IsEnabled = $true
+    }
+    # Desactiver la saisie et les boutons d'action pendant l'execution
+    $txtManualInput.IsEnabled = -not $Busy
+    $btnSendCmd.IsEnabled = -not $Busy
+    $pnlToolsNormal.IsEnabled = -not $Busy
+    if (-not $Busy) { $txtManualInput.Focus() }
+}
+
+# Recupere le resultat du job une fois termine, sans jamais bloquer l'interface.
+$script:jobTimer.Add_Tick({
+        $job = $script:currentJob
+        if (-not $job) { $script:jobTimer.Stop(); return }
+        # Tant que ca tourne, on laisse l'interface libre (l'indicateur s'anime)
+        if ($job.State -eq 'Running' -or $job.State -eq 'NotStarted') { return }
+
+        # Termine (Completed / Failed / Stopped)
+        $script:jobTimer.Stop()
+        try {
+            $rawResults = Receive-Job -Job $job 2>&1
+
+            if ($rawResults) {
+                # Traitement du chemin courant pour la console manuelle
+                if ($script:currentJobIsManual) {
+                    $lastItem = $rawResults | Select-Object -Last 1
+                    if ($lastItem -is [string] -and $lastItem -match "###PWD###(.*)") {
+                        $script:currentPath = $matches[1]
+                        $rawResults = $rawResults | Select-Object -SkipLast 1
+                    }
+                }
+                if ($rawResults) {
+                    $strOutput = $rawResults | Out-String -Width 160
+                    if (-not [string]::IsNullOrWhiteSpace($strOutput)) {
+                        $txtOutput.AppendText($strOutput)
+                    }
+                }
+            }
+            elseif ($job.State -eq 'Completed' -and -not $script:currentJobIsManual) {
+                Log-Message "(Aucune donnee retournee)" "INFO"
+            }
+
+            if ($job.State -eq 'Stopped') {
+                Log-Message "Commande annulee." "WARN"
+            }
+            $txtOutput.ScrollToEnd()
+        }
+        catch {
+            Log-Message "Erreur : $_" "ERROR"
+        }
+        finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            $script:currentJob = $null
+            Set-BusyState $false
+        }
+    })
+
 function Close-CurrentSession {
+    # Arreter proprement une commande encore en cours avant de fermer la session
+    if ($script:currentJob) {
+        $script:jobTimer.Stop()
+        Stop-Job -Job $script:currentJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $script:currentJob -Force -ErrorAction SilentlyContinue
+        $script:currentJob = $null
+        Set-BusyState $false
+    }
+
     if ($script:currentSession) {
         # Sauvegarder le nom de la cible pour la suppression du profil après déconnexion
         $targetMachine = $script:targetName
@@ -406,9 +566,10 @@ Get-ChildItem -Path `$profileListPath | ForEach-Object {
 
 function Execute-OnSession {
     param(
-        [string]$CommandStr, 
+        [string]$CommandStr,
         [scriptblock]$ScriptBlk,
-        [bool]$IsManualConsole = $false
+        [bool]$IsManualConsole = $false,
+        [object[]]$ArgumentList = @()
     )
 
     if (-not $script:currentSession -or (Get-PSSession -Id $script:currentSession.Id -ErrorAction SilentlyContinue).State -ne 'Opened') {
@@ -416,85 +577,53 @@ function Execute-OnSession {
         return
     }
 
-    $window.Cursor = [System.Windows.Input.Cursors]::Wait
-    if (-not $IsManualConsole) {
-        $lblFooterStatus.Text = "Execution..." 
+    # Une seule commande a la fois (la session distante ne supporte pas les appels concurrents)
+    if ($script:currentJob) {
+        Log-Message "Une commande est deja en cours. Patientez ou cliquez sur Annuler." "WARN"
+        return
     }
-    
-    [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
 
+    # Lancement en arriere-plan (-AsJob) : l'interface reste reactive pendant l'execution
     try {
-        $rawResults = $null
-        
         if ($ScriptBlk) {
             # Exécution Bouton
-            $rawResults = Invoke-Command -Session $script:currentSession -ScriptBlock $ScriptBlk -ErrorAction Stop
+            $script:currentJob = Invoke-Command -Session $script:currentSession -ScriptBlock $ScriptBlk -ArgumentList $ArgumentList -AsJob -ErrorAction Stop
         }
         else {
             # Exécution Console (avec PATH)
             $wrapper = [scriptblock]::Create("$CommandStr ; Write-Output ""###PWD###`$(`$PWD.Path)""")
-            $rawResults = Invoke-Command -Session $script:currentSession -ScriptBlock $wrapper -ErrorAction Stop
+            $script:currentJob = Invoke-Command -Session $script:currentSession -ScriptBlock $wrapper -AsJob -ErrorAction Stop
         }
-
-        if ($rawResults) {
-            # Traitement Path pour la console
-            if ($IsManualConsole) {
-                $lastItem = $rawResults | Select-Object -Last 1
-                if ($lastItem -is [string] -and $lastItem -match "###PWD###(.*)") {
-                    $script:currentPath = $matches[1]
-                    $rawResults = $rawResults | Select-Object -SkipLast 1
-                }
-            }
-
-            if ($rawResults) {
-                $strOutput = $rawResults | Out-String -Width 160
-                if (-not [string]::IsNullOrWhiteSpace($strOutput)) {
-                    $txtOutput.AppendText($strOutput)
-                }
-            }
-        }
-        else {
-            if (-not $IsManualConsole) {
-                Log-Message "(Aucune donnée retournée)" "INFO" 
-            }
-        }
-        $txtOutput.ScrollToEnd()
+        $script:currentJobIsManual = $IsManualConsole
+        Set-BusyState $true
+        $script:jobTimer.Start()
     }
     catch {
         Log-Message "Erreur : $_" "ERROR"
-    }
-    finally {
-        $window.Cursor = [System.Windows.Input.Cursors]::Arrow
-        $lblFooterStatus.Text = "Pret."
+        $script:currentJob = $null
+        Set-BusyState $false
     }
 }
 
 # --- HANDLERS ---
 
 $btnConnect.Add_Click({
-        $inputText = $txtComputerNumber.Text.Trim()
-        if ([string]::IsNullOrEmpty($inputText)) {
+        $fullTarget = Resolve-Target
+        if ([string]::IsNullOrEmpty($fullTarget)) {
             Log-Message "Nom de machine invalide." "WARN"
             return
         }
 
-        # Si checkbox cochée OU si le texte contient des lettres (nom complet), utiliser tel quel
-        if ($chkNoPRT.IsChecked -or $inputText -match '[a-zA-Z]') {
-            $fullTarget = $inputText
-        }
-        else {
-            # Sinon, ajouter le préfixe PRT au numéro
-            $num = $inputText -replace "[^0-9]", ""
-            $fullTarget = "PRT$num"
-        }
-        
         Log-Message "Connexion vers $fullTarget..." "CONNECT"
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
         Close-CurrentSession
 
         try {
-            if (-not (Test-Connection -ComputerName $fullTarget -Count 1 -Quiet)) {
-                throw "Ping echoue (Machine offline ?)."
+            # Le ping est indicatif : certaines machines filtrent l'ICMP mais acceptent WinRM.
+            # On previent mais on tente la connexion quand meme.
+            $pingOk = Test-Connection -ComputerName $fullTarget -Count 1 -Quiet -ErrorAction SilentlyContinue
+            if (-not $pingOk) {
+                Log-Message "Ping sans reponse (ICMP filtre ou machine occupee). Tentative WinRM..." "WARN"
             }
 
             $script:currentSession = New-PSSession -ComputerName $fullTarget -ErrorAction Stop
@@ -557,8 +686,27 @@ $btnConnect.Add_Click({
 
         }
         catch {
-            Log-Message "Echec : $_" "ERROR"
-            [System.Windows.MessageBox]::Show("Connexion échouée : $_", "Erreur", "OK", "Error")
+            $errText = "$_"
+            Log-Message "Echec : $errText" "ERROR"
+            # Nettoyer une session partiellement ouverte (handshake echoue) pour eviter les orphelines
+            if ($script:currentSession) {
+                Remove-PSSession -Session $script:currentSession -ErrorAction SilentlyContinue
+                $script:currentSession = $null
+                $script:targetName = $null
+            }
+
+            # Erreur typique WinRM => afficher un diagnostic actionnable dans la console
+            $isWinRm = $errText -match 'WinRM|Remote_?Troubleshooting|WS-?Management|Connecting to remote server|acces(s)? (refuse|denied)|Kerberos|authentif'
+            if ($isWinRm) {
+                Log-Message "Erreur de type WinRM detectee. Lancement du diagnostic..." "INFO"
+                $window.Cursor = [System.Windows.Input.Cursors]::Wait
+                [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
+                try { Log-Message (Get-ConnectionHelp -Target $fullTarget) "RESULT" } catch { }
+                [System.Windows.MessageBox]::Show("Connexion echouee (WinRM).`n`nUn diagnostic detaille et les commandes de correction ont ete ecrits dans la console.`n`nDetail : $errText", "Erreur de connexion (WinRM)", "OK", "Error")
+            }
+            else {
+                [System.Windows.MessageBox]::Show("Connexion echouee : $errText", "Erreur", "OK", "Error")
+            }
         }
         finally {
             $window.Cursor = [System.Windows.Input.Cursors]::Arrow
@@ -593,6 +741,15 @@ $actionSend = {
 }
 
 $btnSendCmd.Add_Click($actionSend)
+
+# Bouton Annuler : stoppe la commande en cours (le timer detecte l'etat Stopped et nettoie)
+$btnCancelCmd.Add_Click({
+        if ($script:currentJob) {
+            Log-Message "Annulation de la commande en cours..." "WARN"
+            $btnCancelCmd.IsEnabled = $false
+            Stop-Job -Job $script:currentJob -ErrorAction SilentlyContinue
+        }
+    })
 
 # Gestion des touches : Enter pour envoyer, ↑/↓ pour l'historique
 # Utiliser PreviewKeyDown pour intercepter les touches avant le TextBox
@@ -646,12 +803,11 @@ $txtManualInput.Add_PreviewKeyDown({
     })
 
 $btnPing.Add_Click({
-        $n = $txtComputerNumber.Text -replace "[^0-9]", ""
-        if ([string]::IsNullOrEmpty($n)) {
-            Log-Message "Veuillez entrer un numero pour tester le Ping." "WARN"
+        $t = Resolve-Target
+        if ([string]::IsNullOrEmpty($t)) {
+            Log-Message "Veuillez entrer un numero ou un nom de machine pour tester le Ping." "WARN"
             return
         }
-        $t = "PRT$n"
         Log-Message "Ping vers $t en cours..." "PING"
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
         [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
@@ -670,12 +826,11 @@ $btnPing.Add_Click({
     })
 
 $btnExternalConsole.Add_Click({
-        $n = $txtComputerNumber.Text -replace "[^0-9]", ""
-        if ([string]::IsNullOrEmpty($n)) {
-            Log-Message "Numero requis pour la console externe." "WARN"
+        $t = Resolve-Target
+        if ([string]::IsNullOrEmpty($t)) {
+            Log-Message "Numero ou nom de machine requis pour la console externe." "WARN"
             return
         }
-        $t = "PRT$n"
         Log-Message "Ouverture Console Externe vers $t..." "ACTION"
         Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "Enter-PSSession -ComputerName $t"
     })
@@ -920,12 +1075,21 @@ $btnScanNetwork.Add_Click({
             $selected = $foundMachines | Out-GridView -Title "Machines disponibles - Double-cliquez pour selectionner" -PassThru
         
             if ($selected) {
-                # Extraire le numero du nom (ex: PRT123 -> 123)
-                if ($selected.Nom -match '\d+') {
-                    $txtComputerNumber.Text = $matches[0]
+                # Remplir le champ cible avec le bon identifiant
+                if ($selected.Nom -match '^PRT(\d+)$') {
+                    # Poste PRT standard : garder juste le numero (le prefixe sera rajoute)
+                    $txtComputerNumber.Text = $matches[1]
+                    $chkNoPRT.IsChecked = $false
+                }
+                elseif ($selected.Nom -and $selected.Nom -ne 'Inconnu') {
+                    # Nom complet (non PRT) : l'utiliser tel quel
+                    $txtComputerNumber.Text = $selected.Nom
+                    $chkNoPRT.IsChecked = $true
                 }
                 else {
-                    $txtComputerNumber.Text = $selected.Nom
+                    # Nom introuvable : retomber sur l'IP
+                    $txtComputerNumber.Text = $selected.IP
+                    $chkNoPRT.IsChecked = $true
                 }
                 Log-Message "Machine selectionnee: $($selected.Nom) ($($selected.IP))" "INFO"
             }
@@ -982,6 +1146,81 @@ $btnExportLog.Add_Click({
         }
     })
 $pnlToolsNormal.Children.Add($btnExportLog) | Out-Null
+
+# Bouton Preparer ce poste (WinRM) - configure la machine LOCALE, aucune connexion requise.
+# A lancer une fois (en admin) sur un poste qui n'arrive pas a se connecter.
+$btnSetupPoste = New-Object System.Windows.Controls.Button
+$btnSetupPoste.Content = "Preparer ce poste (WinRM)"
+$btnSetupPoste.Background = "#795548"
+$btnSetupPoste.Foreground = "White"
+$btnSetupPoste.FontWeight = "Bold"
+$btnSetupPoste.ToolTip = "Active WinRM et configure TrustedHosts sur CE poste (corrige les erreurs about_Remote_Troubleshooting). Necessite les droits admin."
+$btnSetupPoste.Add_Click({
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Configurer WinRM sur CE poste (le votre) ?`n`nCela active PSRemoting et permet de se connecter aux postes distants.`n`nNecessite les droits Administrateur.",
+            "Preparer ce poste",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($confirm -ne 'Yes') { Log-Message "Preparation annulee." "INFO"; return }
+
+        # Valeur TrustedHosts (utile hors domaine / connexion par IP ou nom court)
+        $trusted = [Microsoft.VisualBasic.Interaction]::InputBox(
+            "Machines de confiance (TrustedHosts) :`n`n- '*' = tous les postes (simple, reseau interne)`n- 'PRT*' = uniquement les postes PRT`n- laisser vide = ne pas modifier",
+            "TrustedHosts",
+            "*")
+
+        Log-Message "=== Preparation du poste local (WinRM) ===" "ACTION"
+        $window.Cursor = [System.Windows.Input.Cursors]::Wait
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
+        try {
+            # 1. Activer PSRemoting / WinRM
+            try {
+                Enable-PSRemoting -Force -ErrorAction Stop | Out-Null
+                Log-Message "[OK] WinRM active (Enable-PSRemoting)." "SUCCESS"
+            }
+            catch {
+                Log-Message "[ECHEC] Enable-PSRemoting : $_" "ERROR"
+                Log-Message "        Relancez l'outil en ADMINISTRATEUR (Lanceur.cmd) puis reessayez." "WARN"
+            }
+
+            # 2. Service WinRM en demarrage automatique
+            try {
+                Set-Service -Name WinRM -StartupType Automatic -ErrorAction SilentlyContinue
+                Start-Service -Name WinRM -ErrorAction SilentlyContinue
+                $svc = Get-Service WinRM -ErrorAction SilentlyContinue
+                if ($svc) { Log-Message "[i] Service WinRM : $($svc.Status) (demarrage auto)." "INFO" }
+            }
+            catch { }
+
+            # 3. TrustedHosts
+            if (-not [string]::IsNullOrWhiteSpace($trusted)) {
+                try {
+                    Set-Item WSMan:\localhost\Client\TrustedHosts -Value $trusted -Force -ErrorAction Stop
+                    Log-Message "[OK] TrustedHosts defini sur : $trusted" "SUCCESS"
+                }
+                catch {
+                    Log-Message "[ECHEC] TrustedHosts : $_" "ERROR"
+                }
+            }
+            else {
+                Log-Message "[i] TrustedHosts non modifie (champ vide)." "INFO"
+            }
+
+            # 4. Verification finale
+            try {
+                $th = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value
+                Log-Message "TrustedHosts actuel : $th" "INFO"
+            }
+            catch { }
+
+            Log-Message "=== Preparation terminee. Ce poste peut maintenant initier des connexions distantes. ===" "SUCCESS"
+            [System.Windows.MessageBox]::Show("Preparation terminee.`n`nConsultez la console pour le detail de chaque etape.", "Preparer ce poste", "OK", "Information")
+        }
+        finally {
+            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
+        }
+    })
+$pnlToolsNormal.Children.Add($btnSetupPoste) | Out-Null
 
 # Séparateur visuel
 $separator1 = New-Object System.Windows.Controls.Separator
@@ -1101,7 +1340,7 @@ Add-TaskButton "EventViewer (Erreurs)" {
     "============================================"
 }
 
-Add-TaskButton "Nettoyage Complet" {
+$scriptNettoyageComplet = {
     #Vérifier l'état actuelle du poste coté hibernation
     #powercfg /a
 
@@ -1178,11 +1417,31 @@ Add-TaskButton "Nettoyage Complet" {
     Write-Output ""
     Write-Output "=== Nettoyage terminé ===" 
     Write-Output ""
-    Write-Output "Espace disque libéré." 
+    Write-Output "Espace disque libéré."
     # pause (Commenté pour éviter le blocage de la session distante)
 }
 
-Add-TaskButton "Update Dell (Silent)" { 
+# Bouton Nettoyage Complet (avec confirmation : action destructive)
+$btnNettoyage = New-Object System.Windows.Controls.Button
+$btnNettoyage.Content = "Nettoyage Complet"
+$btnNettoyage.Add_Click({
+        if (-not $script:currentSession) {
+            Log-Message "Connectez-vous d'abord !" "WARN"; return
+        }
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Lancer le nettoyage complet sur $($script:targetName) ?`n`nSeront supprimes : fichiers temporaires, Prefetch, cache Windows Update, caches Dell/HP/MECM, logs, corbeille. L'hibernation sera desactivee.`n`nCette action est irreversible.",
+            "Confirmer le nettoyage complet",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($confirm -ne 'Yes') {
+            Log-Message "Nettoyage annule." "INFO"; return
+        }
+        Log-Message "Lancement : Nettoyage Complet" "ACTION"
+        Execute-OnSession -ScriptBlk $scriptNettoyageComplet
+    })
+$pnlToolsNormal.Children.Add($btnNettoyage) | Out-Null
+
+Add-TaskButton "Update Dell (Silent)" {
     $paths = @(
         "C:\Program Files\Dell\CommandUpdate\dcu-cli.exe",
         "C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe"
@@ -1390,93 +1649,98 @@ $btnUninstall = New-Object System.Windows.Controls.Button
 $btnUninstall.Content = "Supprimer une App"
 $btnUninstall.Add_Click({
         if (-not $script:currentSession) {
-            Log-Message "Connectez-vous d'abord !" "WARN"; return 
+            Log-Message "Connectez-vous d'abord !" "WARN"; return
         }
 
-        Log-Message "Récupération de la liste des logiciels (Win32_Product)... Cela peut être long." "ACTION"
-    
-        # Run in background to not freeze UI? The current design seems to be synchronous in click handlers mostly.
-        # To keep it simple and consistent with other buttons:
+        Log-Message "Recuperation de la liste des logiciels (registre)..." "ACTION"
+        $window.Cursor = [System.Windows.Input.Cursors]::Wait
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
+
         try {
+            # Lecture via le registre : rapide et sans effet de bord.
+            # (Win32_Product declenchait une reparation MSI de tous les paquets = lent et risque.)
             $apps = Invoke-Command -Session $script:currentSession -ScriptBlock {
-                Get-CimInstance Win32_Product | Select-Object Name, Version, IdentifyingNumber, Vendor
+                $paths = @(
+                    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                )
+                Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -and -not $_.SystemComponent -and -not $_.ParentKeyName -and ($_.WindowsInstaller -eq 1 -or $_.UninstallString) } |
+                Select-Object @{N = 'Nom'; E = { $_.DisplayName } },
+                @{N = 'Version'; E = { $_.DisplayVersion } },
+                @{N = 'Editeur'; E = { $_.Publisher } },
+                @{N = 'GUID'; E = { $_.PSChildName } },
+                @{N = 'Quiet'; E = { $_.QuietUninstallString } },
+                @{N = 'UninstallString'; E = { $_.UninstallString } } |
+                Sort-Object Nom
             } -ErrorAction Stop
 
-            if ($apps) {
-                # Selection locale via Out-GridView
-                $selected = $apps | Out-GridView -Title "Sélectionnez l'application à DÉSINSTALLER du poste distant" -PassThru
-            
-                if ($selected) {
-                    $name = $selected.Name
-                    $guid = $selected.IdentifyingNumber
-                
-                    $confirm = [System.Windows.Forms.MessageBox]::Show("Etes-vous SÛR de vouloir désinstaller :`n$name`n($guid) ?", "Confirmation Suppression", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                
-                    if ($confirm -eq 'Yes') {
-                        Log-Message "Lancement de la désinstallation pour $name..." "ACTION"
-                    
-                        $res = Invoke-Command -Session $script:currentSession -ScriptBlock {
-                            param($g)
-                            "--- DIAGNOSTIC DESINSTALLATION ---"
-                            "GUID Cible : $g"
-                        
-                            try {
-                                $p = Get-CimInstance Win32_Product -Filter "IdentifyingNumber='$g'" -ErrorAction Stop
-                            
-                                if ($p) {
-                                    "Paquet trouvé : $($p.Name) (Version: $($p.Version))"
-                                    "Appel de la méthode Uninstall()..."
-                                
-                                    # Appel CIM
-                                    $ret = Invoke-CimMethod -InputObject $p -MethodName Uninstall
-                                
-                                    if ($ret) {
-                                        "Objet retourné par Uninstall :"
-                                        $ret | Out-String | ForEach-Object { "  > $_" }
-                                    
-                                        if ($ret.ReturnValue -eq 0) { 
-                                            "SUCCES : La désinstallation a démarré avec succès." 
-                                        }
-                                        elseif ($ret.ReturnValue -eq 1603) {
-                                            "ERREUR (1603) : Erreur fatale lors de l'installation (souvent droits ou fichier corrompu)."
-                                        }
-                                        elseif ($ret.ReturnValue -eq 1619) {
-                                            "ERREUR (1619) : Package d'installation introuvable ou inaccessible."
-                                        }
-                                        else { 
-                                            "ECHEC : Code retour non-null = $($ret.ReturnValue)" 
-                                        }
-                                    }
-                                    else {
-                                        "ERREUR CRITIQUE : La méthode n'a rien retourné (Null)."
-                                    }
-                                }
-                                else {
-                                    "ERREUR : Impossible de retrouver l'objet Win32_Product avec ce GUID sur la cible."
-                                }
-                            }
-                            catch {
-                                "EXCEPTION SYSTEME : $_"
-                            }
-                            "----------------------------------"
-                        } -ArgumentList $guid
-                    
-                        Log-Message "$res" "RESULT"
+            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
+
+            if (-not $apps) {
+                Log-Message "Aucune application listee depuis le registre." "WARN"
+                return
+            }
+
+            # Selection unique (evite les tableaux qui casseraient la desinstallation)
+            $selected = $apps | Out-GridView -Title "Selectionnez l'application a DESINSTALLER puis OK" -OutputMode Single
+            if (-not $selected) {
+                Log-Message "Aucune application selectionnee." "INFO"
+                return
+            }
+
+            $confirm = [System.Windows.Forms.MessageBox]::Show("Etes-vous SUR de vouloir desinstaller :`n$($selected.Nom)`n($($selected.Version)) ?", "Confirmation Suppression", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            if ($confirm -ne 'Yes') {
+                Log-Message "Action annulee." "INFO"
+                return
+            }
+
+            Log-Message "Desinstallation de $($selected.Nom)..." "ACTION"
+
+            $sb = {
+                param($name, $guid, $quiet, $ustr)
+                "--- DESINSTALLATION ---"
+                "Application : $name"
+                try {
+                    if ($guid -match '^\{[0-9A-Fa-f\-]+\}$') {
+                        # Paquet MSI : desinstallation silencieuse fiable
+                        "Methode : msiexec /x $guid /qn"
+                        $p = Start-Process msiexec.exe -ArgumentList "/x $guid /qn /norestart" -Wait -PassThru -WindowStyle Hidden
+                        switch ($p.ExitCode) {
+                            0 { "SUCCES : desinstallation terminee." }
+                            3010 { "SUCCES : desinstallation terminee (redemarrage requis)." }
+                            1605 { "INFO : produit deja absent." }
+                            1618 { "ERREUR (1618) : une autre installation est en cours, reessayez." }
+                            default { "ECHEC : code de sortie msiexec = $($p.ExitCode)" }
+                        }
+                    }
+                    elseif ($quiet) {
+                        # Desinstalleur silencieux fourni par l'editeur
+                        "Methode : desinstallation silencieuse editeur"
+                        (& cmd.exe /c $quiet 2>&1) | Out-String
+                        "Code de sortie : $LASTEXITCODE"
                     }
                     else {
-                        Log-Message "Action annulée." "INFO"
+                        "AVERTISSEMENT : aucune desinstallation SILENCIEUSE disponible pour cette application."
+                        "Un desinstalleur interactif ne peut pas s'executer via la session distante."
+                        if ($ustr) { "A lancer manuellement sur le poste : $ustr" }
                     }
                 }
-                else {
-                    Log-Message "Aucune application sélectionnée." "INFO"
+                catch {
+                    "EXCEPTION : $_"
                 }
+                "-----------------------"
             }
-            else {
-                Log-Message "Aucune application trouvée via Win32_Product." "WARN"
-            }
+
+            $res = Invoke-Command -Session $script:currentSession -ScriptBlock $sb -ArgumentList $selected.Nom, $selected.GUID, $selected.Quiet, $selected.UninstallString -ErrorAction Stop
+            Log-Message ($res | Out-String) "RESULT"
         }
         catch {
-            Log-Message "Erreur lors de la récupération : $_" "ERROR"
+            Log-Message "Erreur lors de la desinstallation : $_" "ERROR"
+        }
+        finally {
+            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
         }
     })
 $pnlToolsNormal.Children.Add($btnUninstall) | Out-Null
@@ -1551,7 +1815,7 @@ $btnBatt.Add_Click({
                 }
             } -ErrorAction Stop
         
-            Log-Message "$stats" "RESULT"
+            Log-Message ($stats | Out-String) "RESULT"
         }
         catch {
             Log-Message "Erreur lecture batterie : $_" "ERROR"
@@ -1565,12 +1829,12 @@ $btnBatt.Add_Click({
                 powercfg /batteryreport /output $path | Out-Null
             } -ArgumentList $remoteFile -ErrorAction SilentlyContinue
         
-            # Dossier de destination force
-            $destDir = "D:\Temp"
+            # Dossier de destination local
+            $destDir = $script:LocalSaveDir
             if (-not (Test-Path $destDir)) {
-                New-Item -ItemType Directory -Path $destDir -Force | Out-Null 
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
             }
-        
+
             $localDest = "$destDir\Rapport_Batterie_$($script:targetName).html"
             Copy-Item -FromSession $script:currentSession -Path $remoteFile -Destination $localDest -Force
 
@@ -1578,6 +1842,7 @@ $btnBatt.Add_Click({
             Invoke-Item $localDest
         }
         catch {
+            Log-Message "Rapport batterie complet indisponible : $_" "WARN"
         }
     })
 $pnlToolsNormal.Children.Add($btnBatt) | Out-Null
@@ -1605,7 +1870,7 @@ $btnCopyFile.Add_Click({
         }
 
         # Dossier de destination local
-        $defaultLocalDir = "D:\Temp\RecupFiles"
+        $defaultLocalDir = Join-Path $script:LocalSaveDir "RecupFiles"
         $localDestDir = [Microsoft.VisualBasic.Interaction]::InputBox(
             "Dossier de destination sur VOTRE PC:`n(Le dossier sera cree s'il n'existe pas)",
             "Destination locale",
@@ -1980,7 +2245,7 @@ $btnStartup.Add_Click({
                 $hklmRun = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
                 if ($hklmRun) {
                     $hklmRun.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
-                        $results += [PSCustomObject]@{ Nom = $_.Name; Emplacement = "HKLM\Run"; Commande = $_.Value.Substring(0, [Math]::Min(60, $_.Value.Length)) }
+                        $results += [PSCustomObject]@{ Nom = $_.Name; Emplacement = "HKLM\Run"; Commande = ([string]$_.Value).Substring(0, [Math]::Min(60, ([string]$_.Value).Length)) }
                     }
                 }
                 
@@ -1988,7 +2253,7 @@ $btnStartup.Add_Click({
                 $hkcuRun = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
                 if ($hkcuRun) {
                     $hkcuRun.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
-                        $results += [PSCustomObject]@{ Nom = $_.Name; Emplacement = "HKCU\Run"; Commande = $_.Value.Substring(0, [Math]::Min(60, $_.Value.Length)) }
+                        $results += [PSCustomObject]@{ Nom = $_.Name; Emplacement = "HKCU\Run"; Commande = ([string]$_.Value).Substring(0, [Math]::Min(60, ([string]$_.Value).Length)) }
                     }
                 }
                 
@@ -2391,7 +2656,7 @@ $btnSCCM.Add_Click({
             Log-Message "$($apps.Count) application(s) SCCM trouvee(s)" "SUCCESS"
 
             # Afficher la liste pour sélection
-            $selected = $apps | Out-GridView -Title "Applications disponibles - Double-cliquez pour installer" -PassThru
+            $selected = $apps | Out-GridView -Title "Applications disponibles - Selectionnez puis OK pour installer" -OutputMode Single
 
             if ($selected) {
                 $confirm = [System.Windows.Forms.MessageBox]::Show(
@@ -2409,12 +2674,12 @@ $btnSCCM.Add_Click({
                     $result = Invoke-Command -Session $script:currentSession -ScriptBlock {
                         param($appId, $appRevision, $isMachine)
                         try {
-                            $args = @{
+                            $installArgs = @{
                                 Id              = $appId
                                 Revision        = $appRevision
                                 IsMachineTarget = $isMachine
                             }
-                            $install = Invoke-CimMethod -Namespace "root\ccm\ClientSDK" -ClassName CCM_Application -MethodName Install -Arguments $args -ErrorAction Stop
+                            $install = Invoke-CimMethod -Namespace "root\ccm\ClientSDK" -ClassName CCM_Application -MethodName Install -Arguments $installArgs -ErrorAction Stop
                             
                             if ($install.ReturnValue -eq 0) {
                                 return "OK"
@@ -2561,6 +2826,7 @@ $btnLoginLogs.Add_Click({
             
                 foreach ($evt in $successEvents) {
                     $results += [PSCustomObject]@{
+                        Raw    = $evt.TimeCreated
                         Date   = $evt.TimeCreated.ToString("dd/MM HH:mm")
                         Status = "OK"
                         User   = $evt.Properties[5].Value
@@ -2576,14 +2842,15 @@ $btnLoginLogs.Add_Click({
             
                 foreach ($evt in $failEvents) {
                     $results += [PSCustomObject]@{
+                        Raw    = $evt.TimeCreated
                         Date   = $evt.TimeCreated.ToString("dd/MM HH:mm")
                         Status = "ECHEC"
                         User   = $evt.Properties[5].Value
                         Type   = "Tentative"
                     }
                 }
-            
-                return $results | Sort-Object Date -Descending
+
+                return $results | Sort-Object Raw -Descending | Select-Object Date, Status, User, Type
             } -ErrorAction Stop
         
             $output = "`r`n=== LOGS CONNEXIONS (4624/4625) ===`r`n"
@@ -2664,10 +2931,12 @@ $window.Add_KeyDown({
     
         # F5 : Reconnecter
         elseif ($e.Key -eq 'F5') {
-            $num = $txtComputerNumber.Text -replace "[^0-9]", ""
-            if (-not [string]::IsNullOrEmpty($num)) {
+            if (-not [string]::IsNullOrWhiteSpace($txtComputerNumber.Text)) {
                 Log-Message "Reconnexion (F5)..." "INFO"
                 $btnConnect.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+            }
+            else {
+                Log-Message "F5 : aucune cible saisie." "WARN"
             }
             $e.Handled = $true
         }
@@ -4642,7 +4911,7 @@ public class TaskbarShow {
                         return $path
                     } -ErrorAction Stop
 
-                    $destDir = "D:\Temp\Screenshots"
+                    $destDir = Join-Path $script:LocalSaveDir "Screenshots"
                     if (-not (Test-Path $destDir)) {
                         New-Item -ItemType Directory -Path $destDir -Force | Out-Null 
                     }
