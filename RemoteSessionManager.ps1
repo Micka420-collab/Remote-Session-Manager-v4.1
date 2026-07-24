@@ -218,6 +218,57 @@ function Resolve-Target {
     return "PRT$num"
 }
 
+# Diagnostic d'un echec de connexion WinRM (erreur "about_Remote_Troubleshooting").
+# Distingue les problemes cote poste local (client WinRM, TrustedHosts) des problemes
+# cote cible (machine eteinte, WinRM off, pare-feu) et propose les commandes de correction.
+function Get-ConnectionHelp {
+    param([string]$Target)
+    $lines = @()
+    $lines += "=== AIDE : echec de connexion a $Target ==="
+
+    # 1. Service WinRM local (le poste depuis lequel on lance l'outil)
+    try {
+        $svc = Get-Service WinRM -ErrorAction Stop
+        if ($svc.Status -ne 'Running') {
+            $lines += "[!] Service WinRM LOCAL arrete. En admin sur CE poste : Enable-PSRemoting -Force"
+        }
+        else {
+            $lines += "[OK] Service WinRM local demarre."
+        }
+    }
+    catch {
+        $lines += "[!] Impossible de verifier le service WinRM local."
+    }
+
+    # 2. WinRM cote cible
+    try {
+        Test-WSMan -ComputerName $Target -ErrorAction Stop | Out-Null
+        $lines += "[OK] La cible repond a WinRM => le blocage vient des DROITS / de l'AUTHENTIFICATION / de TrustedHosts, pas du reseau."
+    }
+    catch {
+        $lines += "[!] La cible NE repond PAS a WinRM : machine eteinte, WinRM desactive, ou pare-feu/reseau bloque le port 5985."
+        $lines += "    -> Sur la cible (admin) : Enable-PSRemoting -Force"
+    }
+
+    # 3. TrustedHosts (necessaire hors domaine ou par IP/nom court)
+    try {
+        $th = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value
+        if ([string]::IsNullOrWhiteSpace($th)) {
+            $lines += "[i] TrustedHosts vide. Hors domaine, ajoutez la cible (admin) :"
+            $lines += "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$Target' -Concatenate -Force"
+        }
+        else {
+            $lines += "[i] TrustedHosts actuel : $th"
+        }
+    }
+    catch { }
+
+    $lines += "Autres pistes : lancer l'outil en ADMINISTRATEUR (Lanceur.cmd) ; utiliser un compte"
+    $lines += "ayant les droits admin sur la cible ; verifier que les deux postes sont sur le meme domaine/reseau."
+    $lines += "==========================================="
+    return ($lines -join "`r`n")
+}
+
 # Historique des commandes
 $script:commandHistory = @()
 $script:historyIndex = -1
@@ -635,14 +686,27 @@ $btnConnect.Add_Click({
 
         }
         catch {
-            Log-Message "Echec : $_" "ERROR"
+            $errText = "$_"
+            Log-Message "Echec : $errText" "ERROR"
             # Nettoyer une session partiellement ouverte (handshake echoue) pour eviter les orphelines
             if ($script:currentSession) {
                 Remove-PSSession -Session $script:currentSession -ErrorAction SilentlyContinue
                 $script:currentSession = $null
                 $script:targetName = $null
             }
-            [System.Windows.MessageBox]::Show("Connexion echouee : $_", "Erreur", "OK", "Error")
+
+            # Erreur typique WinRM => afficher un diagnostic actionnable dans la console
+            $isWinRm = $errText -match 'WinRM|Remote_?Troubleshooting|WS-?Management|Connecting to remote server|acces(s)? (refuse|denied)|Kerberos|authentif'
+            if ($isWinRm) {
+                Log-Message "Erreur de type WinRM detectee. Lancement du diagnostic..." "INFO"
+                $window.Cursor = [System.Windows.Input.Cursors]::Wait
+                [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
+                try { Log-Message (Get-ConnectionHelp -Target $fullTarget) "RESULT" } catch { }
+                [System.Windows.MessageBox]::Show("Connexion echouee (WinRM).`n`nUn diagnostic detaille et les commandes de correction ont ete ecrits dans la console.`n`nDetail : $errText", "Erreur de connexion (WinRM)", "OK", "Error")
+            }
+            else {
+                [System.Windows.MessageBox]::Show("Connexion echouee : $errText", "Erreur", "OK", "Error")
+            }
         }
         finally {
             $window.Cursor = [System.Windows.Input.Cursors]::Arrow
