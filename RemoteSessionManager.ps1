@@ -1,7 +1,7 @@
-<#
+﻿<#
     RemoteSessionManager.ps1
     Utilitaire de gestion de sessions distantes.
-    Version 4.0
+    Version 4.1
     - Historique des commandes (↑/↓)
     - Boutons: Effacer Console, Exporter Log, Infos Système, Redémarrer, EventViewer
     - Timer de session
@@ -196,6 +196,23 @@ $bdrToolHeader = $window.FindName("bdrToolHeader")
 $script:currentSession = $null
 $script:targetName = $null
 $script:currentPath = ""
+
+# Dossier local pour les rapports/fichiers recuperes (D:\Temp si dispo, sinon Documents)
+$script:LocalSaveDir = if (Test-Path 'D:\') { 'D:\Temp' } else { Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'RSM' }
+
+# Resolution centralisee du nom de la cible :
+# respecte la case "Sans PRT" et les noms de machine complets (avec lettres).
+# Retourne $null si la saisie est vide/invalide.
+function Resolve-Target {
+    $inputText = $txtComputerNumber.Text.Trim()
+    if ([string]::IsNullOrEmpty($inputText)) { return $null }
+    if ($chkNoPRT.IsChecked -or $inputText -match '[a-zA-Z]') {
+        return $inputText
+    }
+    $num = $inputText -replace "[^0-9]", ""
+    if ([string]::IsNullOrEmpty($num)) { return $null }
+    return "PRT$num"
+}
 
 # Historique des commandes
 $script:commandHistory = @()
@@ -406,9 +423,10 @@ Get-ChildItem -Path `$profileListPath | ForEach-Object {
 
 function Execute-OnSession {
     param(
-        [string]$CommandStr, 
+        [string]$CommandStr,
         [scriptblock]$ScriptBlk,
-        [bool]$IsManualConsole = $false
+        [bool]$IsManualConsole = $false,
+        [object[]]$ArgumentList = @()
     )
 
     if (-not $script:currentSession -or (Get-PSSession -Id $script:currentSession.Id -ErrorAction SilentlyContinue).State -ne 'Opened') {
@@ -428,7 +446,7 @@ function Execute-OnSession {
         
         if ($ScriptBlk) {
             # Exécution Bouton
-            $rawResults = Invoke-Command -Session $script:currentSession -ScriptBlock $ScriptBlk -ErrorAction Stop
+            $rawResults = Invoke-Command -Session $script:currentSession -ScriptBlock $ScriptBlk -ArgumentList $ArgumentList -ErrorAction Stop
         }
         else {
             # Exécution Console (avec PATH)
@@ -472,22 +490,12 @@ function Execute-OnSession {
 # --- HANDLERS ---
 
 $btnConnect.Add_Click({
-        $inputText = $txtComputerNumber.Text.Trim()
-        if ([string]::IsNullOrEmpty($inputText)) {
+        $fullTarget = Resolve-Target
+        if ([string]::IsNullOrEmpty($fullTarget)) {
             Log-Message "Nom de machine invalide." "WARN"
             return
         }
 
-        # Si checkbox cochée OU si le texte contient des lettres (nom complet), utiliser tel quel
-        if ($chkNoPRT.IsChecked -or $inputText -match '[a-zA-Z]') {
-            $fullTarget = $inputText
-        }
-        else {
-            # Sinon, ajouter le préfixe PRT au numéro
-            $num = $inputText -replace "[^0-9]", ""
-            $fullTarget = "PRT$num"
-        }
-        
         Log-Message "Connexion vers $fullTarget..." "CONNECT"
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
         Close-CurrentSession
@@ -646,12 +654,11 @@ $txtManualInput.Add_PreviewKeyDown({
     })
 
 $btnPing.Add_Click({
-        $n = $txtComputerNumber.Text -replace "[^0-9]", ""
-        if ([string]::IsNullOrEmpty($n)) {
-            Log-Message "Veuillez entrer un numero pour tester le Ping." "WARN"
+        $t = Resolve-Target
+        if ([string]::IsNullOrEmpty($t)) {
+            Log-Message "Veuillez entrer un numero ou un nom de machine pour tester le Ping." "WARN"
             return
         }
-        $t = "PRT$n"
         Log-Message "Ping vers $t en cours..." "PING"
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
         [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
@@ -670,12 +677,11 @@ $btnPing.Add_Click({
     })
 
 $btnExternalConsole.Add_Click({
-        $n = $txtComputerNumber.Text -replace "[^0-9]", ""
-        if ([string]::IsNullOrEmpty($n)) {
-            Log-Message "Numero requis pour la console externe." "WARN"
+        $t = Resolve-Target
+        if ([string]::IsNullOrEmpty($t)) {
+            Log-Message "Numero ou nom de machine requis pour la console externe." "WARN"
             return
         }
-        $t = "PRT$n"
         Log-Message "Ouverture Console Externe vers $t..." "ACTION"
         Start-Process powershell.exe -ArgumentList "-NoExit", "-Command", "Enter-PSSession -ComputerName $t"
     })
@@ -920,12 +926,21 @@ $btnScanNetwork.Add_Click({
             $selected = $foundMachines | Out-GridView -Title "Machines disponibles - Double-cliquez pour selectionner" -PassThru
         
             if ($selected) {
-                # Extraire le numero du nom (ex: PRT123 -> 123)
-                if ($selected.Nom -match '\d+') {
-                    $txtComputerNumber.Text = $matches[0]
+                # Remplir le champ cible avec le bon identifiant
+                if ($selected.Nom -match '^PRT(\d+)$') {
+                    # Poste PRT standard : garder juste le numero (le prefixe sera rajoute)
+                    $txtComputerNumber.Text = $matches[1]
+                    $chkNoPRT.IsChecked = $false
+                }
+                elseif ($selected.Nom -and $selected.Nom -ne 'Inconnu') {
+                    # Nom complet (non PRT) : l'utiliser tel quel
+                    $txtComputerNumber.Text = $selected.Nom
+                    $chkNoPRT.IsChecked = $true
                 }
                 else {
-                    $txtComputerNumber.Text = $selected.Nom
+                    # Nom introuvable : retomber sur l'IP
+                    $txtComputerNumber.Text = $selected.IP
+                    $chkNoPRT.IsChecked = $true
                 }
                 Log-Message "Machine selectionnee: $($selected.Nom) ($($selected.IP))" "INFO"
             }
@@ -1101,7 +1116,7 @@ Add-TaskButton "EventViewer (Erreurs)" {
     "============================================"
 }
 
-Add-TaskButton "Nettoyage Complet" {
+$scriptNettoyageComplet = {
     #Vérifier l'état actuelle du poste coté hibernation
     #powercfg /a
 
@@ -1178,11 +1193,31 @@ Add-TaskButton "Nettoyage Complet" {
     Write-Output ""
     Write-Output "=== Nettoyage terminé ===" 
     Write-Output ""
-    Write-Output "Espace disque libéré." 
+    Write-Output "Espace disque libéré."
     # pause (Commenté pour éviter le blocage de la session distante)
 }
 
-Add-TaskButton "Update Dell (Silent)" { 
+# Bouton Nettoyage Complet (avec confirmation : action destructive)
+$btnNettoyage = New-Object System.Windows.Controls.Button
+$btnNettoyage.Content = "Nettoyage Complet"
+$btnNettoyage.Add_Click({
+        if (-not $script:currentSession) {
+            Log-Message "Connectez-vous d'abord !" "WARN"; return
+        }
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Lancer le nettoyage complet sur $($script:targetName) ?`n`nSeront supprimes : fichiers temporaires, Prefetch, cache Windows Update, caches Dell/HP/MECM, logs, corbeille. L'hibernation sera desactivee.`n`nCette action est irreversible.",
+            "Confirmer le nettoyage complet",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($confirm -ne 'Yes') {
+            Log-Message "Nettoyage annule." "INFO"; return
+        }
+        Log-Message "Lancement : Nettoyage Complet" "ACTION"
+        Execute-OnSession -ScriptBlk $scriptNettoyageComplet
+    })
+$pnlToolsNormal.Children.Add($btnNettoyage) | Out-Null
+
+Add-TaskButton "Update Dell (Silent)" {
     $paths = @(
         "C:\Program Files\Dell\CommandUpdate\dcu-cli.exe",
         "C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe"
@@ -1460,8 +1495,8 @@ $btnUninstall.Add_Click({
                             }
                             "----------------------------------"
                         } -ArgumentList $guid
-                    
-                        Log-Message "$res" "RESULT"
+
+                        Log-Message ($res | Out-String) "RESULT"
                     }
                     else {
                         Log-Message "Action annulée." "INFO"
@@ -1551,7 +1586,7 @@ $btnBatt.Add_Click({
                 }
             } -ErrorAction Stop
         
-            Log-Message "$stats" "RESULT"
+            Log-Message ($stats | Out-String) "RESULT"
         }
         catch {
             Log-Message "Erreur lecture batterie : $_" "ERROR"
@@ -1565,12 +1600,12 @@ $btnBatt.Add_Click({
                 powercfg /batteryreport /output $path | Out-Null
             } -ArgumentList $remoteFile -ErrorAction SilentlyContinue
         
-            # Dossier de destination force
-            $destDir = "D:\Temp"
+            # Dossier de destination local
+            $destDir = $script:LocalSaveDir
             if (-not (Test-Path $destDir)) {
-                New-Item -ItemType Directory -Path $destDir -Force | Out-Null 
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
             }
-        
+
             $localDest = "$destDir\Rapport_Batterie_$($script:targetName).html"
             Copy-Item -FromSession $script:currentSession -Path $remoteFile -Destination $localDest -Force
 
@@ -1578,6 +1613,7 @@ $btnBatt.Add_Click({
             Invoke-Item $localDest
         }
         catch {
+            Log-Message "Rapport batterie complet indisponible : $_" "WARN"
         }
     })
 $pnlToolsNormal.Children.Add($btnBatt) | Out-Null
@@ -1605,7 +1641,7 @@ $btnCopyFile.Add_Click({
         }
 
         # Dossier de destination local
-        $defaultLocalDir = "D:\Temp\RecupFiles"
+        $defaultLocalDir = Join-Path $script:LocalSaveDir "RecupFiles"
         $localDestDir = [Microsoft.VisualBasic.Interaction]::InputBox(
             "Dossier de destination sur VOTRE PC:`n(Le dossier sera cree s'il n'existe pas)",
             "Destination locale",
@@ -1980,7 +2016,7 @@ $btnStartup.Add_Click({
                 $hklmRun = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
                 if ($hklmRun) {
                     $hklmRun.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
-                        $results += [PSCustomObject]@{ Nom = $_.Name; Emplacement = "HKLM\Run"; Commande = $_.Value.Substring(0, [Math]::Min(60, $_.Value.Length)) }
+                        $results += [PSCustomObject]@{ Nom = $_.Name; Emplacement = "HKLM\Run"; Commande = ([string]$_.Value).Substring(0, [Math]::Min(60, ([string]$_.Value).Length)) }
                     }
                 }
                 
@@ -1988,7 +2024,7 @@ $btnStartup.Add_Click({
                 $hkcuRun = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
                 if ($hkcuRun) {
                     $hkcuRun.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
-                        $results += [PSCustomObject]@{ Nom = $_.Name; Emplacement = "HKCU\Run"; Commande = $_.Value.Substring(0, [Math]::Min(60, $_.Value.Length)) }
+                        $results += [PSCustomObject]@{ Nom = $_.Name; Emplacement = "HKCU\Run"; Commande = ([string]$_.Value).Substring(0, [Math]::Min(60, ([string]$_.Value).Length)) }
                     }
                 }
                 
@@ -2391,7 +2427,7 @@ $btnSCCM.Add_Click({
             Log-Message "$($apps.Count) application(s) SCCM trouvee(s)" "SUCCESS"
 
             # Afficher la liste pour sélection
-            $selected = $apps | Out-GridView -Title "Applications disponibles - Double-cliquez pour installer" -PassThru
+            $selected = $apps | Out-GridView -Title "Applications disponibles - Selectionnez puis OK pour installer" -OutputMode Single
 
             if ($selected) {
                 $confirm = [System.Windows.Forms.MessageBox]::Show(
@@ -2409,12 +2445,12 @@ $btnSCCM.Add_Click({
                     $result = Invoke-Command -Session $script:currentSession -ScriptBlock {
                         param($appId, $appRevision, $isMachine)
                         try {
-                            $args = @{
+                            $installArgs = @{
                                 Id              = $appId
                                 Revision        = $appRevision
                                 IsMachineTarget = $isMachine
                             }
-                            $install = Invoke-CimMethod -Namespace "root\ccm\ClientSDK" -ClassName CCM_Application -MethodName Install -Arguments $args -ErrorAction Stop
+                            $install = Invoke-CimMethod -Namespace "root\ccm\ClientSDK" -ClassName CCM_Application -MethodName Install -Arguments $installArgs -ErrorAction Stop
                             
                             if ($install.ReturnValue -eq 0) {
                                 return "OK"
@@ -2561,6 +2597,7 @@ $btnLoginLogs.Add_Click({
             
                 foreach ($evt in $successEvents) {
                     $results += [PSCustomObject]@{
+                        Raw    = $evt.TimeCreated
                         Date   = $evt.TimeCreated.ToString("dd/MM HH:mm")
                         Status = "OK"
                         User   = $evt.Properties[5].Value
@@ -2576,14 +2613,15 @@ $btnLoginLogs.Add_Click({
             
                 foreach ($evt in $failEvents) {
                     $results += [PSCustomObject]@{
+                        Raw    = $evt.TimeCreated
                         Date   = $evt.TimeCreated.ToString("dd/MM HH:mm")
                         Status = "ECHEC"
                         User   = $evt.Properties[5].Value
                         Type   = "Tentative"
                     }
                 }
-            
-                return $results | Sort-Object Date -Descending
+
+                return $results | Sort-Object Raw -Descending | Select-Object Date, Status, User, Type
             } -ErrorAction Stop
         
             $output = "`r`n=== LOGS CONNEXIONS (4624/4625) ===`r`n"
@@ -2664,10 +2702,12 @@ $window.Add_KeyDown({
     
         # F5 : Reconnecter
         elseif ($e.Key -eq 'F5') {
-            $num = $txtComputerNumber.Text -replace "[^0-9]", ""
-            if (-not [string]::IsNullOrEmpty($num)) {
+            if (-not [string]::IsNullOrWhiteSpace($txtComputerNumber.Text)) {
                 Log-Message "Reconnexion (F5)..." "INFO"
                 $btnConnect.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+            }
+            else {
+                Log-Message "F5 : aucune cible saisie." "WARN"
             }
             $e.Handled = $true
         }
@@ -4642,7 +4682,7 @@ public class TaskbarShow {
                         return $path
                     } -ErrorAction Stop
 
-                    $destDir = "D:\Temp\Screenshots"
+                    $destDir = Join-Path $script:LocalSaveDir "Screenshots"
                     if (-not (Test-Path $destDir)) {
                         New-Item -ItemType Directory -Path $destDir -Force | Out-Null 
                     }
