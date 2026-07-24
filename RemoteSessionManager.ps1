@@ -290,6 +290,7 @@ $script:sessionTimer.Add_Tick({
 # Etat d'execution asynchrone des commandes (evite le gel de l'interface)
 $script:currentJob = $null
 $script:currentJobIsManual = $false
+$script:currentJobOnResult = $null   # callback local optionnel (mise en forme du resultat)
 $script:jobTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:jobTimer.Interval = [TimeSpan]::FromMilliseconds(200)
 
@@ -349,8 +350,16 @@ $script:jobTimer.Add_Tick({
         try {
             $rawResults = Receive-Job -Job $job 2>&1
 
-            if ($rawResults) {
-                # Traitement du chemin courant pour la console manuelle
+            if ($job.State -eq 'Stopped') {
+                Log-Message "Commande annulee." "WARN"
+            }
+            elseif ($script:currentJobOnResult) {
+                # Bouton d'action : mise en forme locale via le callback fourni
+                try { & $script:currentJobOnResult $rawResults }
+                catch { Log-Message "Erreur affichage : $_" "ERROR" }
+            }
+            elseif ($rawResults) {
+                # Console : traitement du chemin courant puis affichage brut
                 if ($script:currentJobIsManual) {
                     $lastItem = $rawResults | Select-Object -Last 1
                     if ($lastItem -is [string] -and $lastItem -match "###PWD###(.*)") {
@@ -368,10 +377,6 @@ $script:jobTimer.Add_Tick({
             elseif ($job.State -eq 'Completed' -and -not $script:currentJobIsManual) {
                 Log-Message "(Aucune donnee retournee)" "INFO"
             }
-
-            if ($job.State -eq 'Stopped') {
-                Log-Message "Commande annulee." "WARN"
-            }
             $txtOutput.ScrollToEnd()
         }
         catch {
@@ -380,6 +385,7 @@ $script:jobTimer.Add_Tick({
         finally {
             Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
             $script:currentJob = $null
+            $script:currentJobOnResult = $null
             Set-BusyState $false
         }
     })
@@ -595,12 +601,47 @@ function Execute-OnSession {
             $script:currentJob = Invoke-Command -Session $script:currentSession -ScriptBlock $wrapper -AsJob -ErrorAction Stop
         }
         $script:currentJobIsManual = $IsManualConsole
+        $script:currentJobOnResult = $null
         Set-BusyState $true
         $script:jobTimer.Start()
     }
     catch {
         Log-Message "Erreur : $_" "ERROR"
         $script:currentJob = $null
+        Set-BusyState $false
+    }
+}
+
+# Lance un traitement distant en arriere-plan (sans figer l'interface) et confie
+# le resultat brut a un callback local $OnResult pour la mise en forme/affichage.
+# Utilise pour les boutons de diagnostic qui formatent le resultat localement.
+function Start-AsyncTask {
+    param(
+        [scriptblock]$ScriptBlk,
+        [object[]]$ArgumentList = @(),
+        [scriptblock]$OnResult
+    )
+
+    if (-not $script:currentSession -or (Get-PSSession -Id $script:currentSession.Id -ErrorAction SilentlyContinue).State -ne 'Opened') {
+        Log-Message "Erreur : Pas de connexion active." "ERROR"
+        return
+    }
+    if ($script:currentJob) {
+        Log-Message "Une commande est deja en cours. Patientez ou cliquez sur Annuler." "WARN"
+        return
+    }
+
+    try {
+        $script:currentJob = Invoke-Command -Session $script:currentSession -ScriptBlock $ScriptBlk -ArgumentList $ArgumentList -AsJob -ErrorAction Stop
+        $script:currentJobIsManual = $false
+        $script:currentJobOnResult = $OnResult
+        Set-BusyState $true
+        $script:jobTimer.Start()
+    }
+    catch {
+        Log-Message "Erreur : $_" "ERROR"
+        $script:currentJob = $null
+        $script:currentJobOnResult = $null
         Set-BusyState $false
     }
 }
@@ -2164,8 +2205,7 @@ $btnPerfLive.Add_Click({
 
         Log-Message "Recuperation des performances sur $($script:targetName)..." "ACTION"
         
-        try {
-            $perf = Invoke-Command -Session $script:currentSession -ScriptBlock {
+        Start-AsyncTask -ScriptBlk {
                 $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
                 $os = Get-CimInstance Win32_OperatingSystem
                 $ramUsed = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 2)
@@ -2190,9 +2230,9 @@ $btnPerfLive.Add_Click({
                     DiskPercent  = $diskPercent
                     TopProcesses = $topProc
                 }
-            } -ErrorAction Stop
-            
-            # Creer barres visuelles
+            } -OnResult {
+                param($perf)
+                # Creer barres visuelles
             function Get-ProgressBar {
                 param($percent, $width = 20)
                 $filled = [math]::Floor($percent / (100 / $width))
@@ -2213,12 +2253,9 @@ $btnPerfLive.Add_Click({
             $output += "  TOP 5 PROCESSUS (CPU):`r`n"
             $output += $($perf.TopProcesses | Format-Table -AutoSize | Out-String)
             $output += "=========================================="
-            
+
             Log-Message $output "RESULT"
-        }
-        catch {
-            Log-Message "Erreur : $_" "ERROR"
-        }
+            }
     })
 $pnlToolsNormal.Children.Add($btnPerfLive) | Out-Null
 
@@ -2237,10 +2274,9 @@ $btnStartup.Add_Click({
 
         Log-Message "Recuperation des programmes au demarrage..." "ACTION"
         
-        try {
-            $startups = Invoke-Command -Session $script:currentSession -ScriptBlock {
+        Start-AsyncTask -ScriptBlk {
                 $results = @()
-                
+
                 # Registre HKLM Run
                 $hklmRun = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
                 if ($hklmRun) {
@@ -2264,8 +2300,8 @@ $btnStartup.Add_Click({
                 }
                 
                 return $results
-            } -ErrorAction Stop
-            
+            } -OnResult {
+                param($startups)
             if ($startups.Count -gt 0) {
                 $output = $startups | Format-Table -AutoSize | Out-String
                 Log-Message "`r`n=== PROGRAMMES AU DEMARRAGE ($($startups.Count)) ===`r`n$output" "RESULT"
@@ -2273,10 +2309,7 @@ $btnStartup.Add_Click({
             else {
                 Log-Message "Aucun programme au demarrage trouve." "INFO"
             }
-        }
-        catch {
-            Log-Message "Erreur : $_" "ERROR"
-        }
+            }
     })
 $pnlToolsNormal.Children.Add($btnStartup) | Out-Null
 
@@ -2296,8 +2329,7 @@ $btnNetDiag.Add_Click({
         Log-Message "Diagnostic reseau en cours sur $($script:targetName)..." "ACTION"
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
         
-        try {
-            $netInfo = Invoke-Command -Session $script:currentSession -ScriptBlock {
+        Start-AsyncTask -ScriptBlk {
                 $results = @()
                 $results += "============================================"
                 $results += "       DIAGNOSTIC RESEAU COMPLET           "
@@ -2345,16 +2377,10 @@ $btnNetDiag.Add_Click({
                 $results += "============================================"
                 
                 return $results -join "`r`n"
-            } -ErrorAction Stop
-            
-            Log-Message "`r`n$netInfo" "RESULT"
-        }
-        catch {
-            Log-Message "Erreur : $_" "ERROR"
-        }
-        finally {
-            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
-        }
+            } -OnResult {
+                param($netInfo)
+                Log-Message "`r`n$netInfo" "RESULT"
+            }
     })
 $pnlToolsNormal.Children.Add($btnNetDiag) | Out-Null
 
@@ -2373,8 +2399,7 @@ $btnUSBHistory.Add_Click({
 
         Log-Message "Recuperation de l'historique USB..." "ACTION"
         
-        try {
-            $usbHistory = Invoke-Command -Session $script:currentSession -ScriptBlock {
+        Start-AsyncTask -ScriptBlk {
                 $devices = @()
                 
                 # USB Storage
@@ -2407,8 +2432,8 @@ $btnUSBHistory.Add_Click({
                 }
                 
                 return $devices | Select-Object -Unique -Property Nom, Type, Fabricant
-            } -ErrorAction Stop
-            
+            } -OnResult {
+                param($usbHistory)
             if ($usbHistory.Count -gt 0) {
                 $output = $usbHistory | Format-Table -AutoSize | Out-String
                 Log-Message "`r`n=== HISTORIQUE USB ($($usbHistory.Count) peripheriques) ===`r`n$output" "RESULT"
@@ -2416,10 +2441,7 @@ $btnUSBHistory.Add_Click({
             else {
                 Log-Message "Aucun historique USB trouve." "INFO"
             }
-        }
-        catch {
-            Log-Message "Erreur : $_" "ERROR"
-        }
+            }
     })
 $pnlToolsNormal.Children.Add($btnUSBHistory) | Out-Null
 
@@ -2507,8 +2529,7 @@ $btnBitlocker.Add_Click({
 
         Log-Message "Verification BitLocker sur $($script:targetName)..." "ACTION"
     
-        try {
-            $bitlockerInfo = Invoke-Command -Session $script:currentSession -ScriptBlock {
+        Start-AsyncTask -ScriptBlk {
                 $results = @()
                 $volumes = Get-BitLockerVolume -ErrorAction SilentlyContinue
                 if ($volumes) {
@@ -2525,15 +2546,12 @@ $btnBitlocker.Add_Click({
                     $results += [PSCustomObject]@{ Lecteur = "N/A"; Status = "BitLocker non disponible"; Methode = "-"; Pourcentage = "-" }
                 }
                 return $results
-            } -ErrorAction Stop
-        
+            } -OnResult {
+                param($bitlockerInfo)
             $output = "`r`n=== BITLOCKER STATUS ===`r`n"
             $output += $bitlockerInfo | Format-Table -AutoSize | Out-String
             Log-Message $output "RESULT"
-        }
-        catch {
-            Log-Message "Erreur : $_" "ERROR"
-        }
+            }
     })
 $pnlToolsNormal.Children.Add($btnBitlocker) | Out-Null
 
@@ -2553,8 +2571,7 @@ $btnRecentSoftware.Add_Click({
         Log-Message "Recherche des logiciels recents sur $($script:targetName)..." "ACTION"
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
     
-        try {
-            $recentApps = Invoke-Command -Session $script:currentSession -ScriptBlock {
+        Start-AsyncTask -ScriptBlk {
                 $cutoffDate = (Get-Date).AddDays(-30)
                 $results = @()
             
@@ -2584,8 +2601,8 @@ $btnRecentSoftware.Add_Click({
                 }
             
                 return $results | Sort-Object Date -Descending | Select-Object -Unique -Property Nom, Date, Version
-            } -ErrorAction Stop
-        
+            } -OnResult {
+                param($recentApps)
             if ($recentApps.Count -gt 0) {
                 $output = "`r`n=== LOGICIELS INSTALLES (30 derniers jours) ===`r`n"
                 $output += $recentApps | Format-Table -AutoSize | Out-String
@@ -2594,13 +2611,7 @@ $btnRecentSoftware.Add_Click({
             else {
                 Log-Message "Aucun logiciel installe dans les 30 derniers jours." "INFO"
             }
-        }
-        catch {
-            Log-Message "Erreur : $_" "ERROR"
-        }
-        finally {
-            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
-        }
+            }
     })
 $pnlToolsNormal.Children.Add($btnRecentSoftware) | Out-Null
 
@@ -2733,8 +2744,7 @@ $btnExtensions.Add_Click({
 
         Log-Message "Recherche des extensions navigateur sur $($script:targetName)..." "ACTION"
     
-        try {
-            $extensions = Invoke-Command -Session $script:currentSession -ScriptBlock {
+        Start-AsyncTask -ScriptBlk {
                 $results = @()
                 $users = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch "Public|Default" }
             
@@ -2779,8 +2789,8 @@ $btnExtensions.Add_Click({
                 }
             
                 return $results
-            } -ErrorAction Stop
-        
+            } -OnResult {
+                param($extensions)
             if ($extensions.Count -gt 0) {
                 $output = "`r`n=== EXTENSIONS NAVIGATEUR ===`r`n"
                 $output += $extensions | Format-Table -AutoSize | Out-String
@@ -2789,10 +2799,7 @@ $btnExtensions.Add_Click({
             else {
                 Log-Message "Aucune extension trouvee." "INFO"
             }
-        }
-        catch {
-            Log-Message "Erreur : $_" "ERROR"
-        }
+            }
     })
 $pnlToolsNormal.Children.Add($btnExtensions) | Out-Null
 
@@ -2812,10 +2819,9 @@ $btnLoginLogs.Add_Click({
         Log-Message "Recuperation des logs de connexion sur $($script:targetName)..." "ACTION"
         $window.Cursor = [System.Windows.Input.Cursors]::Wait
     
-        try {
-            $loginInfo = Invoke-Command -Session $script:currentSession -ScriptBlock {
+        Start-AsyncTask -ScriptBlk {
                 $results = @()
-            
+
                 # Connexions reussies (4624)
                 $successEvents = Get-WinEvent -FilterHashtable @{
                     LogName = 'Security'
@@ -2851,18 +2857,12 @@ $btnLoginLogs.Add_Click({
                 }
 
                 return $results | Sort-Object Raw -Descending | Select-Object Date, Status, User, Type
-            } -ErrorAction Stop
-        
+            } -OnResult {
+                param($loginInfo)
             $output = "`r`n=== LOGS CONNEXIONS (4624/4625) ===`r`n"
             $output += $loginInfo | Format-Table -AutoSize | Out-String
             Log-Message $output "RESULT"
-        }
-        catch {
-            Log-Message "Erreur : $_" "ERROR"
-        }
-        finally {
-            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
-        }
+            }
     })
 $pnlToolsNormal.Children.Add($btnLoginLogs) | Out-Null
 
