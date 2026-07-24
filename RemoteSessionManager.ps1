@@ -104,6 +104,7 @@ Add-Type -AssemblyName System.Windows.Forms
                 <DockPanel>
                     <TextBlock Text="PS >" Foreground="#00FF00" FontFamily="Consolas" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,10,0"/>
                     <Button Name="btnSendCmd" DockPanel.Dock="Right" Content="Envoyer" Background="#555" Foreground="White" Width="60"/>
+                    <Button Name="btnCancelCmd" DockPanel.Dock="Right" Content="Annuler" Background="#D9534F" Foreground="White" Width="60" Margin="0,0,8,0" Visibility="Collapsed" ToolTip="Arreter la commande en cours"/>
                     <TextBox Name="txtManualInput" FontFamily="Consolas" FontSize="12" Background="#222" Foreground="#FFF" BorderThickness="0" Padding="5" Margin="0,0,10,0"/>
                 </DockPanel>
             </Border>
@@ -148,6 +149,7 @@ Add-Type -AssemblyName System.Windows.Forms
 
         <!-- FOOTER -->
         <Grid Grid.Row="2" Grid.ColumnSpan="3" Margin="5,3,5,0">
+            <ProgressBar Name="pbBusy" IsIndeterminate="True" Height="3" VerticalAlignment="Top" Margin="0,-3,0,0" Background="Transparent" Foreground="#007ACC" BorderThickness="0" Visibility="Collapsed"/>
             <TextBlock Text="Pr&#234;t." Name="lblFooterStatus" Foreground="Gray" FontSize="10" HorizontalAlignment="Left" VerticalAlignment="Center"/>
             <TextBlock Name="lblSessionTimer" Text="" Foreground="#007ACC" FontSize="10" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             <TextBlock Name="lblVersion" Text="By Hotline6 - v4.1 [???]" Foreground="Gray" FontSize="10" HorizontalAlignment="Right" VerticalAlignment="Center" Cursor="Hand" ToolTip="Il parait qu'un mot magique existe..."/>
@@ -176,6 +178,8 @@ $pnlToolsNormal = $window.FindName("pnlToolsNormal")
 
 $txtManualInput = $window.FindName("txtManualInput")
 $btnSendCmd = $window.FindName("btnSendCmd")
+$btnCancelCmd = $window.FindName("btnCancelCmd")
+$pbBusy = $window.FindName("pbBusy")
 $lblFooterStatus = $window.FindName("lblFooterStatus")
 $btnPing = $window.FindName("btnPing")
 $btnExternalConsole = $window.FindName("btnExternalConsole")
@@ -232,6 +236,12 @@ $script:sessionTimer.Add_Tick({
         }
     })
 
+# Etat d'execution asynchrone des commandes (evite le gel de l'interface)
+$script:currentJob = $null
+$script:currentJobIsManual = $false
+$script:jobTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:jobTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+
 # --- FUNCTIONS ---
 
 function Log-Message {
@@ -250,7 +260,88 @@ function Log-Message {
     $txtOutput.ScrollToEnd()
 }
 
+# Bascule l'interface entre etat "occupe" (commande en cours) et "pret".
+# Pendant l'execution, on desactive les entrees et on montre un indicateur anime
+# pour que l'utilisateur voie clairement que ca travaille (sans figer la fenetre).
+function Set-BusyState {
+    param([bool]$Busy)
+    if ($Busy) {
+        $window.Cursor = [System.Windows.Input.Cursors]::AppStarting
+        $pbBusy.Visibility = "Visible"
+        $lblFooterStatus.Text = "Execution en cours... (patientez)"
+        $btnCancelCmd.Visibility = "Visible"
+        $btnCancelCmd.IsEnabled = $true
+    }
+    else {
+        $window.Cursor = [System.Windows.Input.Cursors]::Arrow
+        $pbBusy.Visibility = "Collapsed"
+        $lblFooterStatus.Text = "Pret."
+        $btnCancelCmd.Visibility = "Collapsed"
+    }
+    # Desactiver la saisie et les boutons d'action pendant l'execution
+    $txtManualInput.IsEnabled = -not $Busy
+    $btnSendCmd.IsEnabled = -not $Busy
+    $pnlToolsNormal.IsEnabled = -not $Busy
+    if (-not $Busy) { $txtManualInput.Focus() }
+}
+
+# Recupere le resultat du job une fois termine, sans jamais bloquer l'interface.
+$script:jobTimer.Add_Tick({
+        $job = $script:currentJob
+        if (-not $job) { $script:jobTimer.Stop(); return }
+        # Tant que ca tourne, on laisse l'interface libre (l'indicateur s'anime)
+        if ($job.State -eq 'Running' -or $job.State -eq 'NotStarted') { return }
+
+        # Termine (Completed / Failed / Stopped)
+        $script:jobTimer.Stop()
+        try {
+            $rawResults = Receive-Job -Job $job 2>&1
+
+            if ($rawResults) {
+                # Traitement du chemin courant pour la console manuelle
+                if ($script:currentJobIsManual) {
+                    $lastItem = $rawResults | Select-Object -Last 1
+                    if ($lastItem -is [string] -and $lastItem -match "###PWD###(.*)") {
+                        $script:currentPath = $matches[1]
+                        $rawResults = $rawResults | Select-Object -SkipLast 1
+                    }
+                }
+                if ($rawResults) {
+                    $strOutput = $rawResults | Out-String -Width 160
+                    if (-not [string]::IsNullOrWhiteSpace($strOutput)) {
+                        $txtOutput.AppendText($strOutput)
+                    }
+                }
+            }
+            elseif ($job.State -eq 'Completed' -and -not $script:currentJobIsManual) {
+                Log-Message "(Aucune donnee retournee)" "INFO"
+            }
+
+            if ($job.State -eq 'Stopped') {
+                Log-Message "Commande annulee." "WARN"
+            }
+            $txtOutput.ScrollToEnd()
+        }
+        catch {
+            Log-Message "Erreur : $_" "ERROR"
+        }
+        finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            $script:currentJob = $null
+            Set-BusyState $false
+        }
+    })
+
 function Close-CurrentSession {
+    # Arreter proprement une commande encore en cours avant de fermer la session
+    if ($script:currentJob) {
+        $script:jobTimer.Stop()
+        Stop-Job -Job $script:currentJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $script:currentJob -Force -ErrorAction SilentlyContinue
+        $script:currentJob = $null
+        Set-BusyState $false
+    }
+
     if ($script:currentSession) {
         # Sauvegarder le nom de la cible pour la suppression du profil après déconnexion
         $targetMachine = $script:targetName
@@ -434,56 +525,31 @@ function Execute-OnSession {
         return
     }
 
-    $window.Cursor = [System.Windows.Input.Cursors]::Wait
-    if (-not $IsManualConsole) {
-        $lblFooterStatus.Text = "Execution..." 
+    # Une seule commande a la fois (la session distante ne supporte pas les appels concurrents)
+    if ($script:currentJob) {
+        Log-Message "Une commande est deja en cours. Patientez ou cliquez sur Annuler." "WARN"
+        return
     }
-    
-    [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
 
+    # Lancement en arriere-plan (-AsJob) : l'interface reste reactive pendant l'execution
     try {
-        $rawResults = $null
-        
         if ($ScriptBlk) {
             # Exécution Bouton
-            $rawResults = Invoke-Command -Session $script:currentSession -ScriptBlock $ScriptBlk -ArgumentList $ArgumentList -ErrorAction Stop
+            $script:currentJob = Invoke-Command -Session $script:currentSession -ScriptBlock $ScriptBlk -ArgumentList $ArgumentList -AsJob -ErrorAction Stop
         }
         else {
             # Exécution Console (avec PATH)
             $wrapper = [scriptblock]::Create("$CommandStr ; Write-Output ""###PWD###`$(`$PWD.Path)""")
-            $rawResults = Invoke-Command -Session $script:currentSession -ScriptBlock $wrapper -ErrorAction Stop
+            $script:currentJob = Invoke-Command -Session $script:currentSession -ScriptBlock $wrapper -AsJob -ErrorAction Stop
         }
-
-        if ($rawResults) {
-            # Traitement Path pour la console
-            if ($IsManualConsole) {
-                $lastItem = $rawResults | Select-Object -Last 1
-                if ($lastItem -is [string] -and $lastItem -match "###PWD###(.*)") {
-                    $script:currentPath = $matches[1]
-                    $rawResults = $rawResults | Select-Object -SkipLast 1
-                }
-            }
-
-            if ($rawResults) {
-                $strOutput = $rawResults | Out-String -Width 160
-                if (-not [string]::IsNullOrWhiteSpace($strOutput)) {
-                    $txtOutput.AppendText($strOutput)
-                }
-            }
-        }
-        else {
-            if (-not $IsManualConsole) {
-                Log-Message "(Aucune donnée retournée)" "INFO" 
-            }
-        }
-        $txtOutput.ScrollToEnd()
+        $script:currentJobIsManual = $IsManualConsole
+        Set-BusyState $true
+        $script:jobTimer.Start()
     }
     catch {
         Log-Message "Erreur : $_" "ERROR"
-    }
-    finally {
-        $window.Cursor = [System.Windows.Input.Cursors]::Arrow
-        $lblFooterStatus.Text = "Pret."
+        $script:currentJob = $null
+        Set-BusyState $false
     }
 }
 
@@ -601,6 +667,15 @@ $actionSend = {
 }
 
 $btnSendCmd.Add_Click($actionSend)
+
+# Bouton Annuler : stoppe la commande en cours (le timer detecte l'etat Stopped et nettoie)
+$btnCancelCmd.Add_Click({
+        if ($script:currentJob) {
+            Log-Message "Annulation de la commande en cours..." "WARN"
+            $btnCancelCmd.IsEnabled = $false
+            Stop-Job -Job $script:currentJob -ErrorAction SilentlyContinue
+        }
+    })
 
 # Gestion des touches : Enter pour envoyer, ↑/↓ pour l'historique
 # Utiliser PreviewKeyDown pour intercepter les touches avant le TextBox
