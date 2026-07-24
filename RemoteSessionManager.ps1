@@ -277,6 +277,7 @@ function Set-BusyState {
         $pbBusy.Visibility = "Collapsed"
         $lblFooterStatus.Text = "Pret."
         $btnCancelCmd.Visibility = "Collapsed"
+        $btnCancelCmd.IsEnabled = $true
     }
     # Desactiver la saisie et les boutons d'action pendant l'execution
     $txtManualInput.IsEnabled = -not $Busy
@@ -567,8 +568,11 @@ $btnConnect.Add_Click({
         Close-CurrentSession
 
         try {
-            if (-not (Test-Connection -ComputerName $fullTarget -Count 1 -Quiet)) {
-                throw "Ping echoue (Machine offline ?)."
+            # Le ping est indicatif : certaines machines filtrent l'ICMP mais acceptent WinRM.
+            # On previent mais on tente la connexion quand meme.
+            $pingOk = Test-Connection -ComputerName $fullTarget -Count 1 -Quiet -ErrorAction SilentlyContinue
+            if (-not $pingOk) {
+                Log-Message "Ping sans reponse (ICMP filtre ou machine occupee). Tentative WinRM..." "WARN"
             }
 
             $script:currentSession = New-PSSession -ComputerName $fullTarget -ErrorAction Stop
@@ -632,7 +636,13 @@ $btnConnect.Add_Click({
         }
         catch {
             Log-Message "Echec : $_" "ERROR"
-            [System.Windows.MessageBox]::Show("Connexion échouée : $_", "Erreur", "OK", "Error")
+            # Nettoyer une session partiellement ouverte (handshake echoue) pour eviter les orphelines
+            if ($script:currentSession) {
+                Remove-PSSession -Session $script:currentSession -ErrorAction SilentlyContinue
+                $script:currentSession = $null
+                $script:targetName = $null
+            }
+            [System.Windows.MessageBox]::Show("Connexion echouee : $_", "Erreur", "OK", "Error")
         }
         finally {
             $window.Cursor = [System.Windows.Input.Cursors]::Arrow
@@ -1500,93 +1510,98 @@ $btnUninstall = New-Object System.Windows.Controls.Button
 $btnUninstall.Content = "Supprimer une App"
 $btnUninstall.Add_Click({
         if (-not $script:currentSession) {
-            Log-Message "Connectez-vous d'abord !" "WARN"; return 
+            Log-Message "Connectez-vous d'abord !" "WARN"; return
         }
 
-        Log-Message "Récupération de la liste des logiciels (Win32_Product)... Cela peut être long." "ACTION"
-    
-        # Run in background to not freeze UI? The current design seems to be synchronous in click handlers mostly.
-        # To keep it simple and consistent with other buttons:
+        Log-Message "Recuperation de la liste des logiciels (registre)..." "ACTION"
+        $window.Cursor = [System.Windows.Input.Cursors]::Wait
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
+
         try {
+            # Lecture via le registre : rapide et sans effet de bord.
+            # (Win32_Product declenchait une reparation MSI de tous les paquets = lent et risque.)
             $apps = Invoke-Command -Session $script:currentSession -ScriptBlock {
-                Get-CimInstance Win32_Product | Select-Object Name, Version, IdentifyingNumber, Vendor
+                $paths = @(
+                    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                )
+                Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -and -not $_.SystemComponent -and -not $_.ParentKeyName -and ($_.WindowsInstaller -eq 1 -or $_.UninstallString) } |
+                Select-Object @{N = 'Nom'; E = { $_.DisplayName } },
+                @{N = 'Version'; E = { $_.DisplayVersion } },
+                @{N = 'Editeur'; E = { $_.Publisher } },
+                @{N = 'GUID'; E = { $_.PSChildName } },
+                @{N = 'Quiet'; E = { $_.QuietUninstallString } },
+                @{N = 'UninstallString'; E = { $_.UninstallString } } |
+                Sort-Object Nom
             } -ErrorAction Stop
 
-            if ($apps) {
-                # Selection locale via Out-GridView
-                $selected = $apps | Out-GridView -Title "Sélectionnez l'application à DÉSINSTALLER du poste distant" -PassThru
-            
-                if ($selected) {
-                    $name = $selected.Name
-                    $guid = $selected.IdentifyingNumber
-                
-                    $confirm = [System.Windows.Forms.MessageBox]::Show("Etes-vous SÛR de vouloir désinstaller :`n$name`n($guid) ?", "Confirmation Suppression", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
-                
-                    if ($confirm -eq 'Yes') {
-                        Log-Message "Lancement de la désinstallation pour $name..." "ACTION"
-                    
-                        $res = Invoke-Command -Session $script:currentSession -ScriptBlock {
-                            param($g)
-                            "--- DIAGNOSTIC DESINSTALLATION ---"
-                            "GUID Cible : $g"
-                        
-                            try {
-                                $p = Get-CimInstance Win32_Product -Filter "IdentifyingNumber='$g'" -ErrorAction Stop
-                            
-                                if ($p) {
-                                    "Paquet trouvé : $($p.Name) (Version: $($p.Version))"
-                                    "Appel de la méthode Uninstall()..."
-                                
-                                    # Appel CIM
-                                    $ret = Invoke-CimMethod -InputObject $p -MethodName Uninstall
-                                
-                                    if ($ret) {
-                                        "Objet retourné par Uninstall :"
-                                        $ret | Out-String | ForEach-Object { "  > $_" }
-                                    
-                                        if ($ret.ReturnValue -eq 0) { 
-                                            "SUCCES : La désinstallation a démarré avec succès." 
-                                        }
-                                        elseif ($ret.ReturnValue -eq 1603) {
-                                            "ERREUR (1603) : Erreur fatale lors de l'installation (souvent droits ou fichier corrompu)."
-                                        }
-                                        elseif ($ret.ReturnValue -eq 1619) {
-                                            "ERREUR (1619) : Package d'installation introuvable ou inaccessible."
-                                        }
-                                        else { 
-                                            "ECHEC : Code retour non-null = $($ret.ReturnValue)" 
-                                        }
-                                    }
-                                    else {
-                                        "ERREUR CRITIQUE : La méthode n'a rien retourné (Null)."
-                                    }
-                                }
-                                else {
-                                    "ERREUR : Impossible de retrouver l'objet Win32_Product avec ce GUID sur la cible."
-                                }
-                            }
-                            catch {
-                                "EXCEPTION SYSTEME : $_"
-                            }
-                            "----------------------------------"
-                        } -ArgumentList $guid
+            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
 
-                        Log-Message ($res | Out-String) "RESULT"
+            if (-not $apps) {
+                Log-Message "Aucune application listee depuis le registre." "WARN"
+                return
+            }
+
+            # Selection unique (evite les tableaux qui casseraient la desinstallation)
+            $selected = $apps | Out-GridView -Title "Selectionnez l'application a DESINSTALLER puis OK" -OutputMode Single
+            if (-not $selected) {
+                Log-Message "Aucune application selectionnee." "INFO"
+                return
+            }
+
+            $confirm = [System.Windows.Forms.MessageBox]::Show("Etes-vous SUR de vouloir desinstaller :`n$($selected.Nom)`n($($selected.Version)) ?", "Confirmation Suppression", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            if ($confirm -ne 'Yes') {
+                Log-Message "Action annulee." "INFO"
+                return
+            }
+
+            Log-Message "Desinstallation de $($selected.Nom)..." "ACTION"
+
+            $sb = {
+                param($name, $guid, $quiet, $ustr)
+                "--- DESINSTALLATION ---"
+                "Application : $name"
+                try {
+                    if ($guid -match '^\{[0-9A-Fa-f\-]+\}$') {
+                        # Paquet MSI : desinstallation silencieuse fiable
+                        "Methode : msiexec /x $guid /qn"
+                        $p = Start-Process msiexec.exe -ArgumentList "/x $guid /qn /norestart" -Wait -PassThru -WindowStyle Hidden
+                        switch ($p.ExitCode) {
+                            0 { "SUCCES : desinstallation terminee." }
+                            3010 { "SUCCES : desinstallation terminee (redemarrage requis)." }
+                            1605 { "INFO : produit deja absent." }
+                            1618 { "ERREUR (1618) : une autre installation est en cours, reessayez." }
+                            default { "ECHEC : code de sortie msiexec = $($p.ExitCode)" }
+                        }
+                    }
+                    elseif ($quiet) {
+                        # Desinstalleur silencieux fourni par l'editeur
+                        "Methode : desinstallation silencieuse editeur"
+                        (& cmd.exe /c $quiet 2>&1) | Out-String
+                        "Code de sortie : $LASTEXITCODE"
                     }
                     else {
-                        Log-Message "Action annulée." "INFO"
+                        "AVERTISSEMENT : aucune desinstallation SILENCIEUSE disponible pour cette application."
+                        "Un desinstalleur interactif ne peut pas s'executer via la session distante."
+                        if ($ustr) { "A lancer manuellement sur le poste : $ustr" }
                     }
                 }
-                else {
-                    Log-Message "Aucune application sélectionnée." "INFO"
+                catch {
+                    "EXCEPTION : $_"
                 }
+                "-----------------------"
             }
-            else {
-                Log-Message "Aucune application trouvée via Win32_Product." "WARN"
-            }
+
+            $res = Invoke-Command -Session $script:currentSession -ScriptBlock $sb -ArgumentList $selected.Nom, $selected.GUID, $selected.Quiet, $selected.UninstallString -ErrorAction Stop
+            Log-Message ($res | Out-String) "RESULT"
         }
         catch {
-            Log-Message "Erreur lors de la récupération : $_" "ERROR"
+            Log-Message "Erreur lors de la desinstallation : $_" "ERROR"
+        }
+        finally {
+            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
         }
     })
 $pnlToolsNormal.Children.Add($btnUninstall) | Out-Null
