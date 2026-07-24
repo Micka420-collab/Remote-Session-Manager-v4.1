@@ -1147,6 +1147,81 @@ $btnExportLog.Add_Click({
     })
 $pnlToolsNormal.Children.Add($btnExportLog) | Out-Null
 
+# Bouton Preparer ce poste (WinRM) - configure la machine LOCALE, aucune connexion requise.
+# A lancer une fois (en admin) sur un poste qui n'arrive pas a se connecter.
+$btnSetupPoste = New-Object System.Windows.Controls.Button
+$btnSetupPoste.Content = "Preparer ce poste (WinRM)"
+$btnSetupPoste.Background = "#795548"
+$btnSetupPoste.Foreground = "White"
+$btnSetupPoste.FontWeight = "Bold"
+$btnSetupPoste.ToolTip = "Active WinRM et configure TrustedHosts sur CE poste (corrige les erreurs about_Remote_Troubleshooting). Necessite les droits admin."
+$btnSetupPoste.Add_Click({
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Configurer WinRM sur CE poste (le votre) ?`n`nCela active PSRemoting et permet de se connecter aux postes distants.`n`nNecessite les droits Administrateur.",
+            "Preparer ce poste",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($confirm -ne 'Yes') { Log-Message "Preparation annulee." "INFO"; return }
+
+        # Valeur TrustedHosts (utile hors domaine / connexion par IP ou nom court)
+        $trusted = [Microsoft.VisualBasic.Interaction]::InputBox(
+            "Machines de confiance (TrustedHosts) :`n`n- '*' = tous les postes (simple, reseau interne)`n- 'PRT*' = uniquement les postes PRT`n- laisser vide = ne pas modifier",
+            "TrustedHosts",
+            "*")
+
+        Log-Message "=== Preparation du poste local (WinRM) ===" "ACTION"
+        $window.Cursor = [System.Windows.Input.Cursors]::Wait
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
+        try {
+            # 1. Activer PSRemoting / WinRM
+            try {
+                Enable-PSRemoting -Force -ErrorAction Stop | Out-Null
+                Log-Message "[OK] WinRM active (Enable-PSRemoting)." "SUCCESS"
+            }
+            catch {
+                Log-Message "[ECHEC] Enable-PSRemoting : $_" "ERROR"
+                Log-Message "        Relancez l'outil en ADMINISTRATEUR (Lanceur.cmd) puis reessayez." "WARN"
+            }
+
+            # 2. Service WinRM en demarrage automatique
+            try {
+                Set-Service -Name WinRM -StartupType Automatic -ErrorAction SilentlyContinue
+                Start-Service -Name WinRM -ErrorAction SilentlyContinue
+                $svc = Get-Service WinRM -ErrorAction SilentlyContinue
+                if ($svc) { Log-Message "[i] Service WinRM : $($svc.Status) (demarrage auto)." "INFO" }
+            }
+            catch { }
+
+            # 3. TrustedHosts
+            if (-not [string]::IsNullOrWhiteSpace($trusted)) {
+                try {
+                    Set-Item WSMan:\localhost\Client\TrustedHosts -Value $trusted -Force -ErrorAction Stop
+                    Log-Message "[OK] TrustedHosts defini sur : $trusted" "SUCCESS"
+                }
+                catch {
+                    Log-Message "[ECHEC] TrustedHosts : $_" "ERROR"
+                }
+            }
+            else {
+                Log-Message "[i] TrustedHosts non modifie (champ vide)." "INFO"
+            }
+
+            # 4. Verification finale
+            try {
+                $th = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value
+                Log-Message "TrustedHosts actuel : $th" "INFO"
+            }
+            catch { }
+
+            Log-Message "=== Preparation terminee. Ce poste peut maintenant initier des connexions distantes. ===" "SUCCESS"
+            [System.Windows.MessageBox]::Show("Preparation terminee.`n`nConsultez la console pour le detail de chaque etape.", "Preparer ce poste", "OK", "Information")
+        }
+        finally {
+            $window.Cursor = [System.Windows.Input.Cursors]::Arrow
+        }
+    })
+$pnlToolsNormal.Children.Add($btnSetupPoste) | Out-Null
+
 # Séparateur visuel
 $separator1 = New-Object System.Windows.Controls.Separator
 $separator1.Margin = "0,10,0,10"
